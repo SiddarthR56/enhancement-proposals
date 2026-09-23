@@ -12,7 +12,6 @@ prd: "prd.md"
 see-also:
   - "Unified Networking: /enhancements/OSAC-1433-unified-networking"
   - "Default Networking: /enhancements/OSAC-1433-default-networking"
-  - "UI Design (PR 267): https://github.com/osac-project/enhancement-proposals/pull/267"
   - "baremetal-instance-api: https://github.com/osac-project/baremetal-instance-api"
   - "CaaS BM Worker Provisioning: /enhancements/OSAC-2135-caas-bare-metal-worker-provisioning"
 replaces:
@@ -449,7 +448,7 @@ The `mutateBMI()` function in the fulfillment-service's BM reconciler currently 
 
 ### UX Alignment
 
-UI visual contract for BM networking details was introduced in enhancement-proposals [PR #267](https://github.com/osac-project/enhancement-proposals/pull/267) (*UI Design - OSAC-1437-bmaas-networking*). Implementation of the automatic ExternalIP lifecycle states against that contract is [OSAC-4985](https://redhat.atlassian.net/browse/OSAC-4985). BMI networking UI consumes existing public List/Get APIs — no dedicated “get auto ExternalIP” RPC.
+UI implementation of the automatic ExternalIP lifecycle (Pending / Ready / Failed placeholders, auto vs manual distinction) is tracked by [OSAC-4985](https://redhat.atlassian.net/browse/OSAC-4985). BMI networking UI consumes existing public List/Get APIs — no dedicated “get auto ExternalIP” RPC.
 
 | UI behavior | API / metadata | Notes |
 |---|---|---|
