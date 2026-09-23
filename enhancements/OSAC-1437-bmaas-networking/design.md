@@ -12,6 +12,7 @@ prd: "prd.md"
 see-also:
   - "Unified Networking: /enhancements/OSAC-1433-unified-networking"
   - "Default Networking: /enhancements/OSAC-1433-default-networking"
+  - "UI Design (PR 267): https://github.com/osac-project/enhancement-proposals/pull/267"
   - "baremetal-instance-api: https://github.com/osac-project/baremetal-instance-api"
   - "CaaS BM Worker Provisioning: /enhancements/OSAC-2135-caas-bare-metal-worker-provisioning"
 replaces:
@@ -58,7 +59,7 @@ fulfillment-service → creates BaremetalInstance CR → hub cluster
       - reconcileReboot (handoff)                        │
       - reconcileIPDiscovery (DHCP lease query)          │
       - reconcilePower (Ironic/Metal3)                   │
-      - reconcileAutoCleanup (auto ExternalIP CRs)        │
+      - baremetalinstance-cleanup finalizer (deletion only; auto ExternalIP CRs) │
       - finalizers: inventory, baremetalinstance,         │
         baremetalinstance-networking,                     │
         baremetalinstance-cleanup                         │
@@ -239,7 +240,7 @@ Same as VMaaS/CaaS — the networking API is uniform.
      - The optional `interface` references a valid interface name from the BareMetalInstanceType's network ports list
      - If `interface` is omitted, defaults to the first port with `role=fabric` from the BareMetalInstanceType
      - If one attachment is present, it is the implicit primary; omitted or `primary: true` is accepted but redundant, while `primary: false` is rejected
-   - If `auto_external_ip_attachment == true`: in the **same DB transaction as the BareMetalInstance insert**, auto-selects an ExternalIPPool (READY, most available capacity; ties broken by pool ID), creates ExternalIP + ExternalIPAttachment both in **Pending**, decrements pool capacity under row lock, and stamps correlation metadata on both children:
+   - If `auto_external_ip_attachment == true`: in the **same DB transaction as the BareMetalInstance insert**, auto-selects an ExternalIPPool (**READY**, most available capacity, **matching IP family** when a family is specified; today the BMI auto path passes `IP_FAMILY_UNSPECIFIED` so any READY pool is eligible), ties broken by pool ID ascending, creates ExternalIP + ExternalIPAttachment both in **Pending**, decrements pool capacity under row lock, and stamps correlation metadata on both children:
      - labels: `osac.openshift.io/auto-created: "true"`, `osac.openshift.io/auto-created-for: <baremetal-instance-id>`
      - annotation: `osac.openshift.io/owner-reference: <baremetal-instance-id>`
      - `metadata.creator: system`, tenant inherited from the BMI
@@ -315,7 +316,8 @@ Same as VMaaS/CaaS — the networking API is uniform.
 
 10. **Delete BaremetalInstance:**
     - **Auto-provisioned cleanup (API/DB — fulfillment-service):** On `BareMetalInstances.Delete`, if `auto_external_ip_attachment` was true, list ExternalIPAttachments with `auto-created-for=<bmi-id>`, delete each attachment then its ExternalIP (capacity −1) via `externalIPLifecycle`, then delete the BMI. Fail the Delete if cascade fails so retries remain possible.
-    - **Auto-provisioned cleanup (CR — bare-metal-fulfillment-operator):** Finalizer `osac.openshift.io/baremetalinstance-cleanup` lists hub CRs labeled `auto-created=true` and `auto-created-for=<bmi uuid label>`, deletes ExternalIPAttachment CRs first (requeue until gone), then ExternalIP CRs, then removes the finalizer. See [Unified Networking — Auto-provisioned resource cleanup](/enhancements/OSAC-1433-unified-networking/design.md#external-access-same-for-all-resource-types). Both planes are label-scoped and idempotent.
+    - **Auto-provisioned cleanup (CR — bare-metal-fulfillment-operator):** Finalizer `osac.openshift.io/baremetalinstance-cleanup` lists hub CRs labeled `auto-created=true` and `auto-created-for=<bmi uuid label>`, deletes ExternalIPAttachment CRs first (requeue until gone), then ExternalIP CRs, then removes the finalizer. Cleanup lives on BMFO (not osac-operator) because BMFO already owns the BMI CR finalizer chain and IP-discovery lifecycle; co-locating avoids cross-operator ordering on the same CR. See [Unified Networking — Auto-provisioned resource cleanup](/enhancements/OSAC-1433-unified-networking/design.md#external-access-same-for-all-resource-types).
+    - **Dual-plane divergence:** The API/DB cascade is the source of truth for client-visible cleanup (BMI Delete succeeds only after auto children are removed from the fulfillment DB). The BMFO finalizer is the source of truth for hub CR garbage collection. If DB cascade completed but CR cleanup lags, the BMI may already be gone from the API while labeled EIP/EIPA CRs remain until the finalizer finishes (or until permanent-failure orphan handling). Orphan detection is by `auto-created` / `auto-created-for` labels with no live parent BMI. Both planes are label-scoped and idempotent so re-runs are safe.
     - **Manually created resources are NOT cleaned up** — tenant manages their lifecycle (no `auto-created-for` for this BMI, or created without auto labels).
     - **Default networking resources (VN, Subnet, SG, NATGateway) are NOT cleaned up** — tenant-scoped and shared.
     - bare-metal-fulfillment-operator (power-off-first ordering ensures tenant workloads **never** run on the provisioning network):
@@ -443,11 +445,11 @@ The `mutateBMI()` function in the fulfillment-service's BM reconciler currently 
 - If `interface` is omitted: defaults to the first port with `role=fabric` from the BareMetalInstanceType (consistent with the omitted-list default)
 - If a single attachment is present: `primary` is implicit; omitted or `true` is accepted and `false` is rejected
 - The complete resolved `network_attachments` list is immutable after creation; changing it requires deleting and recreating the BaremetalInstance
-- `auto_external_ip_attachment` is immutable after creation
+- `auto_external_ip_attachment` is immutable after creation: Update/PATCH that includes `spec.auto_external_ip_attachment` in the field mask is rejected by the private BareMetalInstances server with `FailedPrecondition` / message containing `auto_external_ip_attachment is immutable` (same pattern as ComputeInstance)
 
 ### UX Alignment
 
-BMI networking UI consumes existing public List/Get APIs — no dedicated “get auto ExternalIP” RPC ([OSAC-4985](https://redhat.atlassian.net/browse/OSAC-4985)).
+UI visual contract for BM networking details was introduced in enhancement-proposals [PR #267](https://github.com/osac-project/enhancement-proposals/pull/267) (*UI Design - OSAC-1437-bmaas-networking*). Implementation of the automatic ExternalIP lifecycle states against that contract is [OSAC-4985](https://redhat.atlassian.net/browse/OSAC-4985). BMI networking UI consumes existing public List/Get APIs — no dedicated “get auto ExternalIP” RPC.
 
 | UI behavior | API / metadata | Notes |
 |---|---|---|
@@ -789,7 +791,7 @@ Resolved: After `reconcileProvisioning` completes and the host has received a DH
 - fulfillment-service: max-one attachment and primary validation (accept single implicit primary, accept explicit primary)
 - fulfillment-service: omitted and partial attachment defaulting (empty `security_groups` is missing; supplied values are preserved; a missing group list defaults only for the tenant default VirtualNetwork and is rejected for a non-default subnet without caller-supplied groups)
 - fulfillment-service: interface validation (reject an interface not in BareMetalInstanceType)
-- fulfillment-service: auto ExternalIP pool selection (pick READY pool with most capacity)
+- fulfillment-service: auto ExternalIP pool selection (READY pool with most capacity, matching IP family when specified; ties by pool ID)
 - fulfillment-service: auto ExternalIP atomicity — pool exhaustion, capacity race, EIP/EIPA/capacity failure roll back BMI with no leak; success stamps Pending EIP+EIPA labels ([OSAC-4982](https://redhat.atlassian.net/browse/OSAC-4982))
 - fulfillment-service: BMI delete cascade removes only auto-created children and restores capacity; manual EIP preserved ([OSAC-4984](https://redhat.atlassian.net/browse/OSAC-4984))
 - bare-metal-fulfillment-operator: reconcileNetworking phase ordering (after provisioning, before reboot; inventory → provisioning → networking → reboot → IP discovery)
