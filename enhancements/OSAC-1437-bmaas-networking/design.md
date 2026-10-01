@@ -3,7 +3,7 @@ title: bmaas-networking
 authors:
   - dmanor@redhat.com
 creation-date: 2026-07-08
-last-updated: 2026-09-28
+last-updated: 2026-10-01
 tracking-link:
   - https://redhat.atlassian.net/browse/OSAC-1437
   - https://redhat.atlassian.net/browse/OSAC-4975
@@ -240,13 +240,13 @@ Same as VMaaS/CaaS — the networking API is uniform.
      - If `interface` is omitted, defaults to the first port with `role=fabric` from the BareMetalInstanceType
      - If one attachment is present, it is the implicit primary; omitted or `primary: true` is accepted but redundant, while `primary: false` is rejected
    - If `auto_external_ip_attachment == true`: in the **same DB transaction as the BareMetalInstance insert**, auto-selects an ExternalIPPool (**READY**, most available capacity, **matching IP family** when a family is specified; today the BMI auto path passes `IP_FAMILY_UNSPECIFIED` so any READY pool is eligible), ties broken by pool ID ascending, creates ExternalIP + ExternalIPAttachment both in **Pending**, decrements pool capacity under row lock, and stamps correlation metadata on both children:
-     - labels: `osac.openshift.io/auto-created: "true"`, `osac.openshift.io/auto-created-for: <baremetal-instance-id>`
-     - annotation: `osac.openshift.io/owner-reference: <baremetal-instance-id>`
+     - labels: `osac.openshift.io/auto-created: "true"`, `osac.openshift.io/auto-created-for: <bmi-id>` where `<bmi-id>` is the BareMetalInstance API resource ID (`metadata.id`)
+     - annotation: `osac.openshift.io/owner-reference: <bmi-id>`
      - `metadata.creator: system`, tenant inherited from the BMI
      - The ExternalIPAttachment references the BareMetalInstance but has no DNAT target yet (BM primary IP is unknown until `reconcileIPDiscovery`).
      - **Atomicity:** any failure (no READY pool, capacity race, EIP create, capacity update, EIPA create) rolls back the BMI, children, and capacity change — no partial state. Pool exhaustion returns an error with nothing persisted.
      - **Synchronous vs async:** NFR-1's "synchronous allocation" means synchronous capacity reservation + Pending record creation; fabric address `ALLOCATED` and attachment `READY` are asynchronous. Create does **not** wait for Allocated/Ready or return a public address. See [Unified Networking — Auto-provisioning lifecycle](/enhancements/OSAC-1433-unified-networking/design.md#external-access-same-for-all-resource-types). Follow-up hardening: [OSAC-4975](https://redhat.atlassian.net/browse/OSAC-4975) / [OSAC-4982](https://redhat.atlassian.net/browse/OSAC-4982).
-   - Creates BaremetalInstance CR with `network_attachments` in spec
+   - Creates BaremetalInstance CR with `network_attachments` in spec and stamps `osac.openshift.io/baremetalinstance-uuid: <bmi-id>` on the CR (same API resource ID used in `auto-created-for` — not the Kubernetes UID)
 
 6. **bare-metal-fulfillment-operator BareMetalInstance controller:**
 
@@ -315,8 +315,8 @@ Same as VMaaS/CaaS — the networking API is uniform.
 
 10. **Delete BaremetalInstance:**
     - **Auto-provisioned cleanup (API/DB — fulfillment-service):** On `BareMetalInstances.Delete`, if `auto_external_ip_attachment` was true, list ExternalIPAttachments with `auto-created-for=<bmi-id>`, delete each attachment then its ExternalIP and restore one slot in the available-capacity counter via `externalIPLifecycle`, then delete the BMI. Fail the Delete if cascade fails so retries remain possible.
-    - **Auto-provisioned cleanup (CR — bare-metal-fulfillment-operator):** Finalizer `osac.openshift.io/baremetalinstance-cleanup` lists hub CRs labeled `auto-created=true` and `auto-created-for=<bmi uuid label>`, deletes ExternalIPAttachment CRs first (requeue until gone), then ExternalIP CRs, then removes the finalizer. Cleanup lives on BMFO (not osac-operator) because BMFO already owns the BMI CR finalizer chain and IP-discovery lifecycle; co-locating avoids cross-operator ordering on the same CR. See [Unified Networking — Auto-provisioned resource cleanup](/enhancements/OSAC-1433-unified-networking/design.md#external-access-same-for-all-resource-types).
-    - **Dual-plane divergence:** The API/DB cascade is the source of truth for client-visible cleanup (BMI Delete succeeds only after auto children are removed from the fulfillment DB). The BMFO finalizer is the source of truth for hub CR garbage collection. If DB cascade completed but CR cleanup lags, the BMI may already be gone from the API while labeled EIP/EIPA CRs remain until the finalizer finishes (or until permanent-failure orphan handling). Orphan detection is by `auto-created` / `auto-created-for` labels with no live parent BMI. Both planes are label-scoped and idempotent so re-runs are safe.
+    - **Auto-provisioned cleanup (CR — bare-metal-fulfillment-operator):** Finalizer `osac.openshift.io/baremetalinstance-cleanup` reads the BMI CR's `osac.openshift.io/baremetalinstance-uuid` label (which equals `<bmi-id>` — the same API resource ID stamped into children's `auto-created-for`), lists hub CRs labeled `auto-created=true` and `auto-created-for=<bmi-id>`, deletes ExternalIPAttachment CRs first (requeue until gone), then ExternalIP CRs, then removes the finalizer. There is no separate ID mapping: fulfillment-service writes the same `<bmi-id>` into both the BMI CR uuid label and child `auto-created-for` labels. Cleanup lives on BMFO (not osac-operator) because BMFO already owns the BMI CR finalizer chain and IP-discovery lifecycle; co-locating avoids cross-operator ordering on the same CR. See [Unified Networking — Auto-provisioned resource cleanup](/enhancements/OSAC-1433-unified-networking/design.md#external-access-same-for-all-resource-types).
+    - **Dual-plane divergence:** The API/DB cascade is the source of truth for client-visible cleanup (BMI Delete succeeds only after auto children are removed from the fulfillment DB). The BMFO finalizer is the source of truth for hub CR garbage collection. If DB cascade completed but CR cleanup lags, the BMI may already be gone from the API while labeled EIP/EIPA CRs remain until the finalizer finishes (or until permanent-failure orphan handling). There is **no separate SLO or timeout** for that lag: BMFO requeues on its normal reconcile interval until children are gone (or until the permanent-failure retry budget is exhausted). After permanent failure, orphaned CRs are left in place — there is **no automated orphan sweep**; detection is manual (labels `auto-created` / `auto-created-for` with no live parent BMI) and cleanup follows [Support Procedures](#symptom-auto-provisioned-externalip-not-cleaned-up-after-baremetalinstance-deletion). Both planes are label-scoped and idempotent so re-runs are safe.
     - **Manually created resources are NOT cleaned up** — tenant manages their lifecycle (no `auto-created-for` for this BMI, or created without auto labels).
     - **Default networking resources (VN, Subnet, SG, NATGateway) are NOT cleaned up** — tenant-scoped and shared.
     - bare-metal-fulfillment-operator (power-off-first ordering ensures tenant workloads **never** run on the provisioning network):
